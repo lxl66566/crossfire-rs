@@ -31,6 +31,9 @@ async-std = {version = "1", optional=true}
 log = { version="0.4", optional=true}
 smallvec = "1"
 pointers = "0"
+# Model-checked tests. Feature-gated instead of RUSTFLAGS="--cfg loom", which
+# would leak into dependencies with their own cfg(loom) shims (e.g. event-listener).
+loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
 log = "0"
@@ -57,6 +60,9 @@ async_std = ["dep:async-std"]
 
 # for test workflow debugging
 trace_log = ["dep:log"]
+
+# Model-checked waker tests: cargo test --lib --release --features loom loom_
+loom = ["dep:loom"]
 
 [package.metadata.docs.rs]
 all-features = true

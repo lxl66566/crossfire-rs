@@ -1,11 +1,12 @@
 //use crate::collections::ArcCell;
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::{
-    atomic::{AtomicU32, AtomicU8, Ordering},
-    Arc, Weak,
-};
+#[cfg(not(feature = "loom"))]
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::*;
 use std::thread;
 
@@ -93,6 +94,12 @@ impl ArcWaker {
     #[inline(always)]
     pub fn weak(&self) -> Weak<WakerInner> {
         Arc::downgrade(&self.0)
+    }
+
+    /// Test-only: clone sharing the same node, for loom thread injection.
+    #[cfg(any(test, feature = "loom"))]
+    pub fn clone_node(&self) -> ArcWaker {
+        ArcWaker(self.0.clone())
     }
 }
 
