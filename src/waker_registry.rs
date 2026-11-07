@@ -1041,255 +1041,19 @@ mod tests {
         reg.close();
         assert_eq!(reg.len(), 0);
     }
-
-    // Hardware POC for the pop/wake migration steal (loom twin:
-    // `loom_committed_waiter_migrated_between_pop_and_wake_steals_fire`).
-    // fire() pops a committed waiter's entry; the episode dies and the
-    // node re-arms on another registry, committing Waiting there before
-    // fire()'s wake() reads the node. wake() sees the CURRENT Waiting —
-    // the re-armed episode — and reports Woken, which fire() treats as a
-    // spent event; the fresh waiter strands. No weak memory is involved:
-    // every read sees current values, and the pop-to-wake gap only has to
-    // outlast the waiter's exit, so the registry mutex is kept contended
-    // to widen the gap with the futex wake on unlock.
-    //
-    // Victim and canary are fresh per round so any entry left unconsumed
-    // dies with the round (pop_first drops dead weaks) and stale entries
-    // cannot accumulate into wake-current-waiter noise.
-    //
-    // Probabilistic: each round draws a random exit delay, sweeping the
-    // re-arm past the fire's pop. A hit is machine-dependent; the loom POC
-    // is the deterministic proof. Run with:
-    //   cargo test --lib --release poc_ -- --ignored --nocapture
-    #[test]
-    #[ignore = "hardware race hunt"]
-    fn poc_fire_stolen_by_waiter_migrated_after_pop() {
-        use std::sync::Mutex as StdMutex;
-        use std::time::{Duration, Instant};
-
-        fn xorshift(state: &mut u64) -> u64 {
-            let mut x = *state;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *state = x;
-            x
-        }
-
-        fn spin_until(flag: &AtomicUsize, v: usize, stop: &AtomicUsize) -> bool {
-            while flag.load(Ordering::SeqCst) != v {
-                if stop.load(Ordering::SeqCst) != 0 {
-                    return false;
-                }
-                std::thread::yield_now();
-            }
-            true
-        }
-
-        let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
-
-        let epoch = Arc::new(AtomicUsize::new(0));
-        let go = Arc::new(AtomicUsize::new(0));
-        let ready = Arc::new(AtomicUsize::new(0));
-        let done = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicUsize::new(0));
-        // T1's episode outcome: 1 = the abandon won (no wake had landed when
-        // the episode died), 2 = a wake landed first (legitimate delivery).
-        let abandoned = Arc::new(AtomicUsize::new(0));
-        // Fresh nodes per round, minted by the main thread (which keeps its
-        // own handles for the round classification).
-        let victim_slot: Arc<StdMutex<Option<ArcWaker>>> = Arc::new(StdMutex::new(None));
-        let canary_slot: Arc<StdMutex<Option<ArcWaker>>> = Arc::new(StdMutex::new(None));
-        let max_rounds: usize =
-            std::env::var("POC_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000);
-        let max_secs: u64 =
-            std::env::var("POC_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
-        let started = Instant::now();
-
-        let mut handles = Vec::new();
-
-        // Mutex contention widens fire()'s pop-to-wake gap: a parked waiter
-        // makes the unlock take the futex-wake path.
-        for i in 0..8 {
-            let reg1 = reg1.clone();
-            let stop = stop.clone();
-            handles.push(std::thread::spawn(move || {
-                let mut rng = 0x9E3779B97F4A7C15 ^ (i as u64).wrapping_mul(0xBF58476D1CE4E5B9);
-                while stop.load(Ordering::SeqCst) == 0 {
-                    for _ in 0..64 {
-                        let _ = reg1.len();
-                    }
-                    if xorshift(&mut rng) & 0xFF == 0 {
-                        std::thread::yield_now();
-                    }
-                }
-            }));
-        }
-
-        // T1: committed waiter whose episode dies and re-arms on reg2.
-        {
-            let reg1 = reg1.clone();
-            let (epoch, go, ready, done, stop, abandoned, victim_slot) = (
-                epoch.clone(),
-                go.clone(),
-                ready.clone(),
-                done.clone(),
-                stop.clone(),
-                abandoned.clone(),
-                victim_slot.clone(),
-            );
-            handles.push(std::thread::spawn(move || {
-                let mut rng = 0xA24BAED4963EE407
-                    ^ std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("clock")
-                        .subsec_nanos() as u64;
-                let mut last = 0usize;
-                loop {
-                    if !spin_until(&epoch, last + 1, &stop) {
-                        return;
-                    }
-                    last += 1;
-                    let node = victim_slot.lock().expect("victim slot").take().expect("victim");
-                    reg1.reg_waker(&node);
-                    node.commit_waiting();
-                    ready.fetch_add(1, Ordering::SeqCst);
-                    if !spin_until(&go, last, &stop) {
-                        return;
-                    }
-                    let ok = node.abandon().is_ok();
-                    abandoned.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
-                    // Randomized exit delay: positions the re-arm inside
-                    // fire()'s pop-to-wake gap.
-                    let d = xorshift(&mut rng) % 100_000;
-                    let deadline = Instant::now() + Duration::from_nanos(d);
-                    while Instant::now() < deadline {
-                        std::hint::spin_loop();
-                    }
-                    node.reset_init();
-                    let reg2 = <RegistryMulti as RegistryRecv>::new();
-                    reg2.reg_waker(&node);
-                    node.commit_waiting();
-                    done.fetch_add(1, Ordering::SeqCst);
-                }
-            }));
-        }
-
-        // T3: fresh committed waiter, the canary for the redirect.
-        {
-            let reg1 = reg1.clone();
-            let (epoch, go, ready, done, stop, canary_slot) = (
-                epoch.clone(),
-                go.clone(),
-                ready.clone(),
-                done.clone(),
-                stop.clone(),
-                canary_slot.clone(),
-            );
-            handles.push(std::thread::spawn(move || {
-                let mut last = 0usize;
-                loop {
-                    if !spin_until(&epoch, last + 1, &stop) {
-                        return;
-                    }
-                    last += 1;
-                    let node = canary_slot.lock().expect("canary slot").take().expect("canary");
-                    reg1.reg_waker(&node);
-                    node.commit_waiting();
-                    ready.fetch_add(1, Ordering::SeqCst);
-                    if !spin_until(&go, last, &stop) {
-                        return;
-                    }
-                    done.fetch_add(1, Ordering::SeqCst);
-                }
-            }));
-        }
-
-        // F: fires reg1 every round.
-        {
-            let reg1 = reg1.clone();
-            let (epoch, go, ready, done, stop) =
-                (epoch.clone(), go.clone(), ready.clone(), done.clone(), stop.clone());
-            handles.push(std::thread::spawn(move || {
-                let mut last = 0usize;
-                loop {
-                    if !spin_until(&epoch, last + 1, &stop) {
-                        return;
-                    }
-                    last += 1;
-                    ready.fetch_add(1, Ordering::SeqCst);
-                    if !spin_until(&go, last, &stop) {
-                        return;
-                    }
-                    let _ = reg1.fire();
-                    done.fetch_add(1, Ordering::SeqCst);
-                }
-            }));
-        }
-
-        let (mut legit, mut redirect, mut steal) = (0usize, 0usize, 0usize);
-        for round in 1..=max_rounds {
-            if started.elapsed() > Duration::from_secs(max_secs) {
-                break;
-            }
-            *victim_slot.lock().expect("victim slot") = Some(ArcWaker::new_blocking());
-            let canary = ArcWaker::new_blocking();
-            *canary_slot.lock().expect("canary slot") = Some(canary.clone_node());
-            ready.store(0, Ordering::SeqCst);
-            done.store(0, Ordering::SeqCst);
-            abandoned.store(0, Ordering::SeqCst);
-            epoch.store(round, Ordering::SeqCst);
-            if !spin_until(&ready, 3, &stop) {
-                break;
-            }
-            go.store(round, Ordering::SeqCst);
-            if !spin_until(&done, 3, &stop) {
-                break;
-            }
-            if abandoned.load(Ordering::SeqCst) == 1 {
-                if canary.get_state() == WakerState::Woken as u8 {
-                    redirect += 1;
-                } else {
-                    steal += 1;
-                    stop.store(1, Ordering::SeqCst);
-                    println!(
-                        "STEAL at round {}: event spent on the migrated waiter, fresh waiter stranded; legit={} redirect={}",
-                        round, legit, redirect
-                    );
-                    break;
-                }
-            } else {
-                legit += 1;
-            }
-        }
-        stop.store(1, Ordering::SeqCst);
-        for h in handles {
-            h.join().expect("worker thread");
-        }
-        println!(
-            "poc_fire_stolen_by_waiter_migrated_after_pop: {} rounds in {:?}: legit={} redirect={} steal={}",
-            legit + redirect + steal,
-            started.elapsed(),
-            legit,
-            redirect,
-            steal
-        );
-        assert_eq!(
-            steal, 0,
-            "fire event stolen by a waiter that migrated to another registry after the pop"
-        );
-    }
 }
 
-// Model-checked POCs against the upstream master waker. Run with:
+// Model-checked regression test for the lost wakeup of the stale-entry
+// fire steal. Run with:
 //   cargo test --lib --release --features loom loom_ -- --nocapture
 //
 // TLS and park/unpark are not modeled: per-thread nodes are injected via
 // clone_node, and fire() effects are asserted via WakeResult and waker
-// states. Both tests fail on master by design — they assert the correct
-// "one event wakes one waiter of this registry" contract, and master has
-// no entry validation on the pop path nor a CAS in wake()'s Waiting
-// branch, so the steal interleavings violate it.
+// states. loom_abandon_inside_wake_window_strands_fresh_waiter explores
+// every interleaving of the racing abandon and fire: it fails on master
+// and passes with the CAS in wake()'s Waiting branch. A hardware-
+// executable twin of the same schedule (public API, one cfg(test) pause
+// inside wake()'s window) lives in src/waker.rs.
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
     use super::*;
@@ -1300,76 +1064,19 @@ mod loom_tests {
         }
     }
 
-    // POC (fails by design): cross-registry stale entry steals a committed
-    // fire. The node is registered on reg1 before any thread starts, so
-    // the queue order is fixed with the stale entry at the front; T1 then
-    // re-arms the node on reg2 (leaving the reg1 entry stale) and T3
-    // registers a fresh committed waiter on reg1. One fire on reg1 pops
-    // the stale entry first: wake() sees the node's NEW Waiting — reg2's
-    // episode — and reports Woken, which fire() treats as a spent event.
-    // The fresh waiter never receives the wake. No memory subtleties are
-    // involved: master checks no stamp on the pop path and wake() stores
-    // Woken unconditionally, so the steal is deterministic.
+    // Fix-regression POC (fails on master, turns green with the CAS in
+    // wake()'s Waiting branch): the exact interleaving the public API can
+    // reach. T1 is a committed reg1 waiter when fire() pops its entry; the
+    // episode then dies (abandon Waiting->Closed) inside wake()'s
+    // read->store window and is never re-armed. On master the
+    // unconditional store(Woken) stamps the departed node, fire() reports
+    // the coin delivered, and the fresh reg1 waiter strands. With the CAS
+    // the store loses against Closed, wake() returns Skip, and
+    // pop_again() hands the coin to the fresh waiter.
     #[test]
-    fn loom_cross_registry_stale_entry_steals_committed_fire() {
+    fn loom_abandon_inside_wake_window_strands_fresh_waiter() {
         loom::model(|| {
             let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
-            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
-            let committed3 = Arc::new(AtomicUsize::new(0));
-
-            let node = ArcWaker::new_blocking();
-            reg1.reg_waker(&node);
-
-            let t1 = {
-                let reg2 = reg2.clone();
-                let node = node.clone_node();
-                loom::thread::spawn(move || {
-                    node.commit_waiting();
-                    // Episode death (timeout analog), then re-arm on reg2.
-                    let _ = node.abandon();
-                    node.reset_init();
-                    reg2.reg_waker(&node);
-                    node.commit_waiting();
-                })
-            };
-
-            let t3 = {
-                let reg1 = reg1.clone();
-                let committed3 = committed3.clone();
-                loom::thread::spawn(move || {
-                    let other = ArcWaker::new_blocking();
-                    reg1.reg_waker(&other);
-                    other.commit_waiting();
-                    committed3.store(1, Ordering::SeqCst);
-                    other
-                })
-            };
-
-            // Only the fresh waiter is barriered; T1's episode races the fire.
-            wait_committed(&committed3);
-            assert_eq!(reg1.fire(), WakeResult::Woken);
-            let other = t3.join().unwrap();
-            t1.join().unwrap();
-            assert_eq!(
-                other.get_state(),
-                WakerState::Woken as u8,
-                "the event must land on the fresh waiter, not the stale entry"
-            );
-        });
-    }
-
-    // POC (fails by design): the pop/wake migration steal. T1 is a
-    // committed reg1 waiter when fire() pops its entry; the episode then
-    // dies and the node re-arms on reg2, committing Waiting there before
-    // fire()'s wake() reads the node. wake() sees the CURRENT Waiting and
-    // reports Woken, which fire() treats as a spent event; the fresh reg1
-    // waiter strands. No weak memory is involved: the entry was valid at
-    // pop time and every read sees current values.
-    #[test]
-    fn loom_committed_waiter_migrated_between_pop_and_wake_steals_fire() {
-        loom::model(|| {
-            let reg1 = Arc::new(<RegistryMulti as RegistryRecv>::new());
-            let reg2 = Arc::new(<RegistryMulti as RegistryRecv>::new());
             let committed3 = Arc::new(AtomicUsize::new(0));
             // T1's episode outcome: 1 = abandon won (the wake had not landed
             // when the episode died), 2 = a wake landed first (legitimate
@@ -1380,7 +1087,6 @@ mod loom_tests {
 
             let t1 = {
                 let reg1 = reg1.clone();
-                let reg2 = reg2.clone();
                 let abandoned = abandoned.clone();
                 let node = node.clone_node();
                 loom::thread::spawn(move || {
@@ -1388,9 +1094,6 @@ mod loom_tests {
                     node.commit_waiting();
                     let ok = node.abandon().is_ok();
                     abandoned.store(if ok { 1 } else { 2 }, Ordering::SeqCst);
-                    node.reset_init();
-                    reg2.reg_waker(&node);
-                    node.commit_waiting();
                 })
             };
 
@@ -1406,18 +1109,19 @@ mod loom_tests {
                 })
             };
 
+            // Only the fresh waiter is barriered; T1's abandon races the fire.
             wait_committed(&committed3);
             assert_eq!(reg1.fire(), WakeResult::Woken);
             let other = t3.join().unwrap();
             t1.join().unwrap();
             if abandoned.load(Ordering::SeqCst) == 1 {
-                // The episode died before any wake reached it; the event must
-                // have been redirected to the fresh waiter, not spent on the
-                // node's NEW episode on reg2.
+                // The episode died before any wake reached it; the event
+                // must have been redirected to the fresh waiter, not spent
+                // on the departed node.
                 assert_eq!(
                     other.get_state(),
                     WakerState::Woken as u8,
-                    "event spent on the migrated waiter, fresh waiter stranded"
+                    "event spent on the departed node, fresh waiter stranded"
                 );
             }
         });

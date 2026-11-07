@@ -37,6 +37,22 @@ impl WakeResult {
     }
 }
 
+/// POC-only: holds wake() between its Waiting read and the store, so a test
+/// can schedule a waiter's departure inside the read->store window. It
+/// stands in for a preemption at that instruction boundary (the OS may stop
+/// a thread between any two instructions, for milliseconds at a time); it
+/// changes no state and no ordering, and is absent from non-test builds.
+#[cfg(all(test, not(feature = "loom")))]
+static POC_WAKE_GATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(all(test, not(feature = "loom")))]
+fn poc_wake_window_gate() {
+    while !POC_WAKE_GATE.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+}
+
 pub struct ArcWaker(Arc<WakerInner>);
 
 impl fmt::Debug for ArcWaker {
@@ -288,6 +304,8 @@ impl WakerInner {
             if state >= WakerState::Woken as u8 {
                 return WakeResult::Skip;
             } else if state == WakerState::Waiting as u8 {
+                #[cfg(all(test, not(feature = "loom")))]
+                poc_wake_window_gate();
                 self.state.store(WakerState::Woken as u8, Ordering::SeqCst);
                 self.get_waker().wake_by_ref();
                 return WakeResult::Woken;
@@ -415,5 +433,112 @@ mod tests {
         use std::mem::size_of;
         println!("wakertype {}", size_of::<ThinWaker>());
         println!("waker inner {}", size_of::<WakerInner>());
+    }
+}
+
+// Deterministic POC for the stale-entry fire steal (lost wakeup), public
+// API only, no model checker. The gate above widens exactly the
+// read->store boundary under test; the loom twin covering all
+// interleavings of the racing abandon and fire lives in
+// src/waker_registry.rs. Run with:
+//   cargo test --lib --release poc_departure -- --nocapture
+#[cfg(all(test, not(feature = "loom")))]
+mod poc_tests {
+    use super::*;
+    use crate::mpmc::bounded_blocking;
+    use crate::{BlockingRxTrait, RecvTimeoutError};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Choreography:
+    /// 1. the victim parks with a 500 ms deadline (its entry is the one
+    ///    fire() pops, so it must register first);
+    /// 2. the canary parks behind it with a deadline beyond the test;
+    /// 3. the gate closes and one send fires the coin: wake() reads the
+    ///    victim's Waiting and spins on the gate;
+    /// 4. the victim's deadline expires INSIDE the window: its abandon CAS
+    ///    Waiting->Closed wins, it reports the departure and exits;
+    /// 5. the gate opens; wake() resumes.
+    /// On master the unconditional store(Woken) stamps the departed node,
+    /// fire() reports the coin delivered and stops popping: the canary is
+    /// never woken and the item stays buffered. With the CAS fix the store
+    /// loses against Closed, wake() returns Skip, and pop_again() hands the
+    /// coin to the canary.
+    #[test]
+    fn poc_departure_inside_wake_window_strands_parked_receiver() {
+        let (tx, rx) = bounded_blocking::<u32>(8);
+        let (depart_tx, depart_rx) = mpsc::channel::<bool>();
+        let (got_tx, got_rx) = mpsc::channel::<u32>();
+
+        let victim = {
+            let rx = rx.clone();
+            thread::spawn(move || {
+                let departed = matches!(
+                    rx.recv_timeout(Duration::from_millis(500)),
+                    Err(RecvTimeoutError::Timeout)
+                );
+                let _ = depart_tx.send(departed);
+            })
+        };
+        // The victim must be parked before the canary registers, so that
+        // fire() pops the victim's entry first.
+        thread::sleep(Duration::from_millis(150));
+
+        let canary = {
+            let rx = rx.clone();
+            thread::spawn(move || {
+                let _ = got_tx.send(match rx.recv_timeout(Duration::from_secs(2)) {
+                    Ok(v) => v,
+                    Err(_) => 0,
+                });
+            })
+        };
+        thread::sleep(Duration::from_millis(150));
+
+        // Close the window, then fire exactly one coin through the sender.
+        // The original tx stays alive in this thread: dropping the last
+        // sender would close the channel and let the canary drain the
+        // stranded item through the disconnect sweep, masking the bug.
+        POC_WAKE_GATE.store(false, Ordering::Release);
+        let sender = {
+            let tx = tx.clone();
+            thread::spawn(move || tx.send(42).expect("send with free space"))
+        };
+
+        // The sender is now spinning inside wake() past its Waiting read;
+        // let the victim's deadline expire inside the window.
+        let departed = match depart_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(v) => v,
+            Err(_) => {
+                POC_WAKE_GATE.store(true, Ordering::Release);
+                panic!("victim never reported its departure");
+            }
+        };
+        assert!(departed, "victim must depart by its own deadline");
+        assert!(
+            !sender.is_finished(),
+            "sender must be held inside the window when the victim departs"
+        );
+        thread::sleep(Duration::from_millis(10)); // the Closed store drains
+        POC_WAKE_GATE.store(true, Ordering::Release);
+        sender.join().expect("sender thread");
+
+        // Settle: a woken canary drains well within this window.
+        thread::sleep(Duration::from_millis(200));
+        if !rx.is_empty() {
+            panic!(
+                "lost wakeup: a departure inside wake()'s read->store window \
+                 spent the coin on the departed victim; item 42 stays buffered \
+                 and the parked canary is never woken"
+            );
+        }
+        assert_eq!(
+            got_rx.recv_timeout(Duration::from_secs(2)).expect("canary verdict"),
+            42,
+            "the coin must be redirected to the live canary"
+        );
+        victim.join().expect("victim thread");
+        canary.join().expect("canary thread");
     }
 }
